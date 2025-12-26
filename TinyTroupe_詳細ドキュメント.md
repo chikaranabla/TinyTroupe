@@ -1332,6 +1332,332 @@ except Exception as e:
 
 ---
 
+## TALKアクションとCONVERSATION刺激の詳細
+
+### TALKアクションとCONVERSATION刺激の関係
+
+TinyTroupeでは、エージェントが**TALKアクション**を実行すると、それが**CONVERSATION刺激**として他のエージェントに送信されます。
+
+#### 基本的な流れ
+
+```
+1. エージェントAがTALKアクションを生成
+   └─ action = {"type": "TALK", "content": "Hello", "target": "B"}
+
+2. 環境が_handle_talk()を呼び出し
+   └─ target_agent = world.get_agent_by_name("B")
+   └─ target_agent.listen("Hello", source=A)
+
+3. エージェントBがCONVERSATION刺激を受信
+   └─ B._observe({
+        "type": "CONVERSATION",
+        "content": "Hello",
+        "source": "A"
+      })
+
+4. エージェントBが次のステップで応答
+   └─ B.act() → TALKアクションを生成
+```
+
+### 同一ステップでの複数エージェントへのTALK
+
+#### 質問: エージェントは同一ステップで複数人に同じ言葉を話しかけることが可能か？
+
+**答え: はい、可能です。ただし、1つのTALKアクションで1つのターゲットにのみ話しかけます。**
+
+エージェントは1つのステップで複数のTALKアクションを生成できますが、各TALKアクションは1つのターゲットにのみ送信されます。
+
+**例**:
+```python
+# エージェントAが複数のTALKアクションを生成
+actions = [
+    {"type": "TALK", "content": "Hello", "target": "B"},
+    {"type": "TALK", "content": "Hello", "target": "C"},
+    {"type": "DONE", "content": "", "target": ""}
+]
+```
+
+この場合、エージェントBとCの両方が`CONVERSATION`刺激として"Hello"を受信します。
+
+#### 実装の詳細
+
+**`_handle_talk`メソッド**（`tiny_world.py` 490-506行）:
+```python
+def _handle_talk(self, source_agent: TinyPerson, content: str, target: str):
+    target_agent = self.get_agent_by_name(target)
+    
+    if target_agent is not None:
+        # ターゲットエージェントにCONVERSATION刺激として送信
+        target_agent.listen(content, source=source_agent)
+    elif self.broadcast_if_no_target:
+        # ターゲットが見つからない場合、ブロードキャスト
+        self.broadcast(content, source=source_agent)
+```
+
+**重要なポイント**:
+- 1つのTALKアクション = 1つのターゲットに送信
+- ターゲットが見つからない場合、`broadcast_if_no_target=True`なら全エージェントにブロードキャスト
+- 各エージェントは個別に`listen()`メソッドが呼ばれる
+
+### 同一ステップで複数人から話しかけられた場合
+
+#### 質問: 同じステップで複数人に話しかけられたときはどうなるのか？
+
+**答え: エージェントは複数のCONVERSATION刺激を順次受信し、次のステップで応答します。**
+
+**処理フロー**:
+```
+Step 1:
+  - エージェントA: TALK "Hello" → B
+  - エージェントC: TALK "Hi" → B
+  - エージェントB: CONVERSATION刺激を2つ受信
+    ├─ {"type": "CONVERSATION", "content": "Hello", "source": "A"}
+    └─ {"type": "CONVERSATION", "content": "Hi", "source": "C"}
+
+Step 2:
+  - エージェントB: act()を実行
+  - プロンプトには両方のCONVERSATION刺激が含まれる
+  - エージェントBは両方に応答するか、または統合して応答する
+```
+
+**実装の詳細**:
+
+**`listen`メソッド**（`tiny_person.py` 679-705行）:
+```python
+def listen(self, speech, source: AgentOrWorld = None):
+    return self._observe({
+        "type": "CONVERSATION",
+        "content": speech,
+        "source": name_or_empty(source),
+    })
+```
+
+**`_observe`メソッド**（`tiny_person.py` 786-820行）:
+```python
+def _observe(self, stimulus, ...):
+    stimuli = [stimulus]
+    content = {"stimuli": stimuli}
+    
+    # 記憶に保存
+    self.store_in_memory({
+        'role': 'user',
+        'content': content,
+        'type': 'stimulus',
+        'simulation_timestamp': self.iso_datetime()
+    })
+```
+
+**重要なポイント**:
+- 複数のCONVERSATION刺激は、それぞれ個別に`_observe()`が呼ばれる
+- 各刺激は`current_messages`に追加される
+- 次の`act()`呼び出し時に、すべての刺激がプロンプトに含まれる
+- エージェントは複数の刺激に対して統合的に応答できる
+
+### 表示ロジック: `+ -->`の意味
+
+#### 質問: `+ --> 子供_C`などの意味は？
+
+**答え: これは表示の最適化機能です。同じソース、同じタイプ、同じコンテンツで異なるターゲットに送信された場合、追加のターゲットを`+ -->`で表示します。**
+
+**実装の詳細**（`tiny_world.py` 596-673行）:
+
+```python
+def _push_and_display_latest_communication(self, communication):
+    # 前回の通信と比較
+    if len(self._displayed_communications_buffer) > 0:
+        last_communication = self._displayed_communications_buffer[-1]
+        
+        # 同じソース、同じタイプ、同じコンテンツで異なるターゲットの場合
+        if (last_source == current_source) and \
+           (last_type == current_type) and \
+           (last_kind == current_kind) and \
+           (last_content == current_content) and \
+           (current_target is not None):
+            
+            # 追加ターゲットをバッファに追加
+            self._target_display_communications_buffer.append(current_target)
+            
+            # `+ --> target`形式で表示
+            communication["rendering"] = \
+                " " * len(last_source) + \
+                f"[{rich_style}]       + --> [underline]{current_target}[/][/]"
+```
+
+**例**:
+```
+親_A --> 大人_B: [CONVERSATION]
+         > おはようございます。今日も一日、家族のために頑張って仕事に向かいます。
+          + --> 子供_C
+```
+
+この表示は、親_Aが同じ内容を大人_Bと子供_Cの両方に送信したことを示しています。
+
+**重要なポイント**:
+- `+ -->`は表示の最適化であり、実際の送信とは独立している
+- 同じステップ内で同じエージェントが同じ内容を複数のターゲットに送信した場合に表示される
+- `max_additional_targets_to_display`パラメータで表示数を制限できる（デフォルト: 3）
+
+### 問題の原因と解決策
+
+#### 問題: 一人が二人どちらもに会話しているログが「キモイ」
+
+**原因**:
+1. **エージェントが同じ内容を複数のターゲットに送信している**
+   - エージェントが「皆さん」という表現を使い、複数のターゲットに同じメッセージを送信している
+   - または、エージェントが1つのターゲットにTALKしているが、`broadcast_if_no_target=True`によりブロードキャストされている
+
+2. **表示の最適化が誤って動作している**
+   - 同じステップ内で複数のエージェントが同じ内容を話している場合、表示ロジックが統合して表示している
+
+**解決策**:
+
+**1. エージェントのプロンプトを調整**
+```python
+# ペルソナ定義で、1対1の会話を推奨
+agent.define("behaviors", {
+    "communication_style": [
+        "You prefer one-on-one conversations over group messages.",
+        "When talking to multiple people, you address them individually.",
+        "You avoid using 'everyone' or 'all of you' in your messages."
+    ]
+})
+```
+
+**2. `broadcast_if_no_target`をFalseに設定**
+```python
+world = TinyWorld("Chat Room", [lisa, oscar], broadcast_if_no_target=False)
+```
+
+**3. エージェントが1つのターゲットにのみTALKするように制約を追加**
+```python
+# カスタム環境で_handle_talkをオーバーライド
+class CustomWorld(TinyWorld):
+    def _handle_talk(self, source_agent, content, target):
+        # ターゲットが指定されていない場合、エラーを出す
+        if not target:
+            logger.warning(f"{source_agent.name} tried to TALK without a target")
+            return
+        
+        # 通常の処理を実行
+        super()._handle_talk(source_agent, content, target)
+```
+
+**4. 表示の最適化を無効化**
+```python
+world = TinyWorld("Chat Room", [lisa, oscar], max_additional_targets_to_display=0)
+```
+
+### 実際の動作例
+
+#### シナリオ1: 1対1の会話
+
+```
+Step 1:
+  親_A acts: [TALK] "おはよう" → 大人_B
+  大人_B: CONVERSATION刺激を受信
+
+Step 2:
+  大人_B acts: [TALK] "おはよう" → 親_A
+  親_A: CONVERSATION刺激を受信
+```
+
+**表示**:
+```
+親_A --> 大人_B: [CONVERSATION]
+         > おはよう
+大人_B --> 親_A: [CONVERSATION]
+          > おはよう
+```
+
+#### シナリオ2: 1対多の会話（同じ内容）
+
+```
+Step 1:
+  親_A acts: 
+    [TALK] "おはよう" → 大人_B
+    [TALK] "おはよう" → 子供_C
+  大人_B: CONVERSATION刺激を受信
+  子供_C: CONVERSATION刺激を受信
+
+Step 2:
+  大人_B acts: [TALK] "おはよう" → 親_A
+  子供_C acts: [TALK] "おはよう" → 親_A
+  親_A: CONVERSATION刺激を2つ受信
+```
+
+**表示**:
+```
+親_A --> 大人_B: [CONVERSATION]
+         > おはよう
+          + --> 子供_C
+大人_B --> 親_A: [CONVERSATION]
+          > おはよう
+子供_C --> 親_A: [CONVERSATION]
+          > おはよう
+```
+
+#### シナリオ3: 複数人から同時に話しかけられる
+
+```
+Step 1:
+  親_A acts: [TALK] "おはよう" → 大人_B
+  子供_C acts: [TALK] "おはよう" → 大人_B
+  大人_B: CONVERSATION刺激を2つ受信
+    ├─ {"type": "CONVERSATION", "content": "おはよう", "source": "親_A"}
+    └─ {"type": "CONVERSATION", "content": "おはよう", "source": "子供_C"}
+
+Step 2:
+  大人_B acts: [TALK] "おはよう、みんな" → 親_A
+  大人_B: 両方の刺激に対して統合的に応答
+```
+
+**表示**:
+```
+親_A --> 大人_B: [CONVERSATION]
+         > おはよう
+子供_C --> 大人_B: [CONVERSATION]
+          > おはよう
+大人_B --> 親_A: [CONVERSATION]
+          > おはよう、みんな
+```
+
+### ベストプラクティス
+
+#### 1. 1対1の会話を推奨
+
+エージェントのペルソナ定義で、1対1の会話を推奨する設定を追加:
+
+```python
+agent.define("behaviors", {
+    "communication_style": [
+        "You prefer direct, one-on-one conversations.",
+        "When addressing multiple people, you speak to them individually.",
+        "You avoid generic group messages."
+    ]
+})
+```
+
+#### 2. ターゲットを明確に指定
+
+エージェントがTALKアクションを生成する際、必ずターゲットを指定するようにプロンプトで指示:
+
+```
+- You must always specify a target when using TALK action.
+- If you want to talk to multiple people, use separate TALK actions for each.
+```
+
+#### 3. `broadcast_if_no_target`の適切な設定
+
+- **1対1の会話を重視する場合**: `broadcast_if_no_target=False`
+- **グループ会話を許可する場合**: `broadcast_if_no_target=True`
+
+#### 4. 表示の最適化の調整
+
+- **詳細な表示が必要な場合**: `max_additional_targets_to_display=None`（すべて表示）
+- **簡潔な表示を好む場合**: `max_additional_targets_to_display=0`（最適化を無効化）
+
+---
+
 ## まとめ
 
 このドキュメントでは、TinyTroupeの主要なコンポーネントとその動作について詳しく説明しました。主要なポイント:
@@ -1341,6 +1667,14 @@ except Exception as e:
 3. **Memory System**: エピソード記憶と意味記憶で現実的な記憶を実現
 4. **ActionGenerator**: 品質チェックと再生成メカニズムで高品質なアクションを生成
 5. **Control System**: トランザクションとキャッシュ管理で効率的なシミュレーションを実現
+6. **TALK/CONVERSATION**: エージェント間の通信メカニズム。TALKアクションがCONVERSATION刺激として送信される
 
 これらのコンポーネントを組み合わせることで、現実的な人間の行動をシミュレートし、ビジネスや研究のための洞察を得ることができます。
+
+### 重要な注意事項
+
+- **TALKアクションは1つのターゲットにのみ送信される**（複数のターゲットに送信する場合は複数のTALKアクションが必要）
+- **複数のCONVERSATION刺激は順次受信され、次のステップで応答される**
+- **`+ -->`表示は表示の最適化であり、実際の送信とは独立している**
+- **`broadcast_if_no_target`の設定により、ターゲットが見つからない場合の動作が変わる**
 
